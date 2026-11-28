@@ -1120,6 +1120,79 @@ class ProjectGeneratorTests: XCTestCase {
                 try expect(embeddedFrameworks) == expectedEmbeddedFrameworks
             }
 
+            $0.it("embeds but doesn't link transitive dependencies of app extensions") {
+                let app = Target(
+                    name: "App",
+                    type: .application,
+                    platform: .iOS,
+                    dependencies: [
+                        Dependency(type: .target, reference: "AppExtension"),
+                        Dependency(type: .framework, reference: "FrameworkShared.framework"),
+                        Dependency(type: .target, reference: "StaticLibrary"),
+                    ]
+                )
+                let appExtension = Target(
+                    name: "AppExtension",
+                    type: .appExtension,
+                    platform: .iOS,
+                    dependencies: [
+                        Dependency(type: .target, reference: "ExtensionFramework"),
+                        Dependency(type: .framework, reference: "FrameworkA.framework"),
+                        Dependency(type: .framework, reference: "FrameworkShared.framework"),
+                        Dependency(type: .framework, reference: "FrameworkC.framework"),
+                        Dependency(type: .sdk(root: nil), reference: "NotificationCenter.framework"),
+                    ]
+                )
+                let extensionFramework = Target(
+                    name: "ExtensionFramework",
+                    type: .framework,
+                    platform: .iOS,
+                    dependencies: [
+                        Dependency(type: .framework, reference: "FrameworkB.framework"),
+                    ]
+                )
+                // Also links FrameworkC, which the app then needs to link too
+                let staticLibrary = Target(
+                    name: "StaticLibrary",
+                    type: .staticLibrary,
+                    platform: .iOS,
+                    dependencies: [
+                        Dependency(type: .framework, reference: "FrameworkC.framework"),
+                    ]
+                )
+
+                let project = Project(
+                    name: "test",
+                    targets: [app, appExtension, extensionFramework, staticLibrary],
+                    options: SpecOptions(transitivelyLinkDependencies: true)
+                )
+                let pbxProject = try project.generatePbxProj()
+
+                let appTarget = try unwrap(pbxProject.nativeTargets.first(where: { $0.name == app.name }))
+                let buildPhases = appTarget.buildPhases
+                let frameworkPhases = pbxProject.frameworksBuildPhases.filter { buildPhases.contains($0) }
+                let copyFilesPhases = pbxProject.copyFilesBuildPhases.filter { buildPhases.contains($0) }
+                let embedFrameworkPhase = copyFilesPhases.first { $0.dstSubfolderSpec == .frameworks }
+
+                // Only the app's own dependencies are linked
+                let linkFrameworks = frameworkPhases.flatMap { $0.files ?? [] }.compactMap { $0.file?.nameOrPath }
+                try expect(Set(linkFrameworks)) == [
+                    "FrameworkC.framework",
+                    "FrameworkShared.framework",
+                    "libStaticLibrary.a",
+                ]
+
+                // The extension's frameworks are still embedded in the app, so the extension can load them
+                let embeddedFrameworks = Set((embedFrameworkPhase?.files ?? []).compactMap { $0.file?.nameOrPath })
+                try expect(embeddedFrameworks) == [
+                    "ExtensionFramework.framework",
+                    "FrameworkA.framework",
+                    "FrameworkB.framework",
+                    "FrameworkC.framework",
+                    "FrameworkShared.framework",
+                ]
+            }
+
             $0.it("copies files only on install in the Embed Frameworks step") {
                 let app = Target(
                     name: "App",

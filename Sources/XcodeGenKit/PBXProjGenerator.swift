@@ -1624,19 +1624,36 @@ public class PBXProjGenerator {
     func getAllDependenciesPlusTransitiveNeedingEmbedding(target topLevelTarget: Target) -> [Dependency] {
         // this is used to resolve cyclical target dependencies
         var visitedTargets: Set<String> = []
+        var visitedExtensionTargets: Set<String> = []
         var dependencies: [String: Dependency] = [:]
-        var queue: [Target] = [topLevelTarget]
+        // Dependencies only reached through an app extension. The extension links them itself,
+        // so the top level target only embeds them, where the extension loads them from.
+        var extensionDependencyIDs: Set<String> = []
+        var queue: [(target: Target, isInExtension: Bool)] = [(topLevelTarget, false)]
         while !queue.isEmpty {
-            let target = queue.removeFirst()
-            if visitedTargets.contains(target.name) {
+            let (target, isInExtension) = queue.removeFirst()
+            if visitedTargets.contains(target.name) || (isInExtension && visitedExtensionTargets.contains(target.name)) {
                 continue
             }
 
             let isTopLevel = target == topLevelTarget
 
+            func addDependency(_ dependency: Dependency) {
+                var dependency = dependency
+                if isInExtension {
+                    dependency.link = false
+                    extensionDependencyIDs.insert(dependency.uniqueID)
+                } else {
+                    extensionDependencyIDs.remove(dependency.uniqueID)
+                }
+                dependencies[dependency.uniqueID] = dependency
+            }
+
             for dependency in target.dependencies {
-                // don't overwrite dependencies, to allow top level ones to rule
-                if dependencies[dependency.uniqueID] != nil {
+                // don't overwrite dependencies, to allow top level ones to rule,
+                // unless an extension's dependency is also needed outside of extensions
+                if dependencies[dependency.uniqueID] != nil,
+                   isInExtension || !extensionDependencyIDs.contains(dependency.uniqueID) {
                     continue
                 }
 
@@ -1645,10 +1662,13 @@ public class PBXProjGenerator {
                 // For some more context about the `dependency.embed != true` lines, refer to https://github.com/yonaskolb/XcodeGen/pull/820
                 switch dependency.type {
                 case .sdk:
-                    dependencies[dependency.uniqueID] = dependency
+                    // SDK dependencies are never embedded, so the extension's own linking is enough
+                    if !isInExtension {
+                        addDependency(dependency)
+                    }
                 case .framework, .carthage, .package:
                     if isTopLevel || dependency.embed != true {
-                        dependencies[dependency.uniqueID] = dependency
+                        addDependency(dependency)
                     }
                 case .target:
                     let dependencyTargetReference = try! TargetReference(dependency.reference)
@@ -1657,29 +1677,33 @@ public class PBXProjGenerator {
                     case .local:
                         if isTopLevel || dependency.embed != true {
                             if let dependencyTarget = project.getTarget(dependency.reference) {
-                                dependencies[dependency.uniqueID] = dependency
+                                addDependency(dependency)
                                 if !dependencyTarget.shouldEmbedDependencies {
                                     // traverse target's dependencies if it doesn't embed them itself
-                                    queue.append(dependencyTarget)
+                                    queue.append((dependencyTarget, isInExtension || dependencyTarget.type.isExtension))
                                 }
                             } else if project.getAggregateTarget(dependency.reference) != nil {
                                 // Aggregate targets should be included
-                                dependencies[dependency.uniqueID] = dependency
+                                addDependency(dependency)
                             }
                         }
                     case .project:
                         if isTopLevel || dependency.embed != true {
-                            dependencies[dependency.uniqueID] = dependency
+                            addDependency(dependency)
                         }
                     }
                 case .bundle:
                     if isTopLevel {
-                        dependencies[dependency.uniqueID] = dependency
+                        addDependency(dependency)
                     }
                 }
             }
 
-            visitedTargets.update(with: target.name)
+            if isInExtension {
+                visitedExtensionTargets.insert(target.name)
+            } else {
+                visitedTargets.insert(target.name)
+            }
         }
 
         return dependencies.sorted(by: { $0.key < $1.key }).map { $0.value }
